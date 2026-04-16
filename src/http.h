@@ -19,6 +19,44 @@ struct mg_http_message {
   struct mg_str message;  // Request + headers + body
 };
 
+enum mg_rate_limit_algorithm {
+  MG_RATELIMIT_ALGO_TOKEN_BUCKET = 0,
+  MG_RATELIMIT_ALGO_SLIDING_WINDOW = 1,
+  MG_RATELIMIT_ALGO_FIXED_WINDOW = 2,
+};
+
+struct mg_rate_limit_rule {
+  enum mg_rate_limit_algorithm algorithm;  // Algorithm used by this rule
+  double rate;                             // Token bucket refill rate, tokens/sec
+  double capacity;                         // Token bucket capacity (burst)
+  uint32_t window_size;                    // Sliding/fixed window size, seconds
+  uint32_t max_requests;                   // Sliding/fixed max requests per window
+};
+
+typedef bool (*mg_rate_limit_whitelist_fn)(struct mg_connection *c,
+                                           struct mg_http_message *hm,
+                                           void *userdata);
+
+struct mg_rate_limit_opts {
+  struct mg_rate_limit_rule global;     // Global rate limit, all requests
+  struct mg_rate_limit_rule per_ip;     // Per source IP limit
+  struct mg_rate_limit_rule per_route;  // Per route limit
+  size_t max_entries;                   // Max in-memory entries
+  uint64_t cleanup_interval_ms;         // Stale entry cleanup interval
+  uint32_t stale_after_sec;             // Entry inactivity expiration
+  mg_rate_limit_whitelist_fn whitelist; // Whitelist callback, optional
+  void *whitelist_data;                 // User data for whitelist callback
+};
+
+// Internal helper result type used by HTTP serving code
+struct mg_rate_limit_result {
+  bool allowed;
+  uint32_t limit;
+  uint32_t remaining;
+  uint32_t reset;
+  uint32_t retry_after;
+};
+
 // Parameter for mg_http_serve_dir()
 struct mg_http_serve_opts {
   const char *root_dir;       // Web root directory, must be non-NULL
@@ -27,7 +65,12 @@ struct mg_http_serve_opts {
   const char *mime_types;     // Extra mime types, ext1=type1,ext2=type2,..
   const char *page404;        // Path to the 404 page, or NULL by default
   struct mg_fs *fs;           // Filesystem implementation. Use NULL for POSIX
+  struct mg_rate_limit_opts *rate_limit;  // Optional rate limiting settings
 };
+
+bool mg_rate_limit_check(struct mg_connection *c, struct mg_http_message *hm,
+                         const struct mg_rate_limit_opts *opts,
+                         struct mg_rate_limit_result *res);
 
 // Parameter for mg_http_next_multipart
 struct mg_http_part {

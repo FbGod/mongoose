@@ -844,6 +844,16 @@ static void eh1(struct mg_connection *c, int ev, void *ev_data) {
       memset(&sopts, 0, sizeof(sopts));
       sopts.mime_types = "*=a/b,txt=c/d";
       mg_http_serve_file(c, hm, "data/a.txt", &sopts);
+    } else if (mg_match(hm->uri, mg_str("/ratelimit/*"), NULL)) {
+      struct mg_http_serve_opts sopts;
+      struct mg_rate_limit_opts ropts;
+      memset(&sopts, 0, sizeof(sopts));
+      memset(&ropts, 0, sizeof(ropts));
+      ropts.per_ip.algorithm = MG_RATELIMIT_ALGO_FIXED_WINDOW;
+      ropts.per_ip.window_size = 1;
+      ropts.per_ip.max_requests = 2;
+      sopts.rate_limit = &ropts;
+      mg_http_serve_file(c, hm, "data/a.txt", &sopts);
     } else {
       struct mg_http_serve_opts sopts;
       memset(&sopts, 0, sizeof(sopts));
@@ -1081,6 +1091,13 @@ static void test_http_server(void) {
 
   ASSERT(fetch(&mgr, buf, url, "GET /%%61.txt HTTP/1.0\n\n") == 200);
   ASSERT(cmpbody(buf, "hello\n") == 0);
+
+  ASSERT(fetch(&mgr, buf, url, "GET /ratelimit/a.txt HTTP/1.0\n\n") == 200);
+  ASSERT(cmpheader(buf, "X-RateLimit-Limit", "2"));
+  ASSERT(fetch(&mgr, buf, url, "GET /ratelimit/a.txt HTTP/1.0\n\n") == 200);
+  ASSERT(fetch(&mgr, buf, url, "GET /ratelimit/a.txt HTTP/1.0\n\n") == 429);
+  ASSERT(cmpheader(buf, "Retry-After", "1"));
+  ASSERT(cmpheader(buf, "X-RateLimit-Remaining", "0"));
 
   // Invalid header: failure
   ASSERT(fetch(&mgr, buf, url, "GET /a.txt HTTP/1.0\nA B\n\n") == 0);

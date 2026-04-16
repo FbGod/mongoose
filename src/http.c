@@ -6,6 +6,7 @@
 #include "log.h"
 #include "net.h"
 #include "printf.h"
+#include "rate_limit.h"
 #include "ssi.h"
 #include "util.h"
 #include "version.h"
@@ -575,10 +576,49 @@ static int getrange(struct mg_str *s, size_t *a, size_t *b) {
   return (int) numparsed;
 }
 
-void mg_http_serve_file(struct mg_connection *c, struct mg_http_message *hm,
-                        const char *path,
-                        const struct mg_http_serve_opts *opts) {
+static size_t mg_http_append_headers(char *dst, size_t dstlen, const char *a,
+                                     const char *b) {
+  size_t n = 0;
+  if (dstlen == 0) return 0;
+  dst[0] = '\0';
+  if (a != NULL) n += mg_snprintf(dst + n, dstlen - n, "%s", a);
+  if (b != NULL && n < dstlen) n += mg_snprintf(dst + n, dstlen - n, "%s", b);
+  return n;
+}
+
+static bool mg_http_apply_rate_limit(struct mg_connection *c,
+                                     struct mg_http_message *hm,
+                                     const struct mg_http_serve_opts *opts,
+                                     char *headers, size_t headers_len) {
+  struct mg_rate_limit_result r;
+  if (opts == NULL || opts->rate_limit == NULL) return true;
+  if (!mg_rate_limit_check(c, hm, opts->rate_limit, &r)) {
+    char rl[160];
+    mg_snprintf(rl, sizeof(rl),
+                "Retry-After: %u\r\n"
+                "X-RateLimit-Limit: %u\r\n"
+                "X-RateLimit-Remaining: 0\r\n"
+                "X-RateLimit-Reset: %u\r\n",
+                r.retry_after, r.limit, r.reset);
+    mg_http_append_headers(headers, headers_len, opts->extra_headers, rl);
+    mg_http_reply(c, 429, headers, "Too many requests\n");
+    return false;
+  }
+  mg_snprintf(headers, headers_len,
+              "X-RateLimit-Limit: %u\r\n"
+              "X-RateLimit-Remaining: %u\r\n"
+              "X-RateLimit-Reset: %u\r\n",
+              r.limit, r.remaining, r.reset);
+  return true;
+}
+
+static void mg_http_serve_file2(struct mg_connection *c, struct mg_http_message *hm,
+                                const char *path,
+                                const struct mg_http_serve_opts *opts,
+                                bool enforce_rate_limit) {
   char etag[64], tmp[MG_PATH_MAX];
+  char rl_headers[160], extra_headers[512];
+  const char *eh = opts->extra_headers;
   struct mg_fs *fs = opts->fs == NULL ? &mg_fs_posix : opts->fs;
   struct mg_fd *fd = NULL;
   size_t size = 0;
@@ -586,6 +626,17 @@ void mg_http_serve_file(struct mg_connection *c, struct mg_http_message *hm,
   struct mg_str *inm = NULL;
   struct mg_str mime = guess_content_type(mg_str(path), opts->mime_types);
   bool gzip = false;
+  rl_headers[0] = extra_headers[0] = '\0';
+
+  if (enforce_rate_limit &&
+      !mg_http_apply_rate_limit(c, hm, opts, rl_headers, sizeof(rl_headers))) {
+    return;
+  }
+  if (rl_headers[0] != '\0') {
+    mg_http_append_headers(extra_headers, sizeof(extra_headers), opts->extra_headers,
+                           rl_headers);
+    eh = extra_headers;
+  }
 
   if (path != NULL) {
     // If a browser sends us "Accept-Encoding: gzip", try to open .gz first
@@ -609,14 +660,14 @@ void mg_http_serve_file(struct mg_connection *c, struct mg_http_message *hm,
   }
 
   if (fd == NULL || fs->st(path, &size, &mtime) == 0) {
-    mg_http_reply(c, 404, opts->extra_headers, "Not found\n");
+    mg_http_reply(c, 404, eh, "Not found\n");
     mg_fs_close(fd);
     // NOTE: mg_http_etag() call should go first!
   } else if (mg_http_etag(etag, sizeof(etag), size, mtime) != NULL &&
              (inm = mg_http_get_header(hm, "If-None-Match")) != NULL &&
              mg_strcasecmp(*inm, mg_str(etag)) == 0) {
     mg_fs_close(fd);
-    mg_http_reply(c, 304, opts->extra_headers, "");
+    mg_http_reply(c, 304, eh, "");
   } else {
     int n, status = 200;
     char range[100];
@@ -650,7 +701,7 @@ void mg_http_serve_file(struct mg_connection *c, struct mg_http_message *hm,
               "%s%s%s\r\n",
               status, mg_http_status_code_str(status), (int) mime.len, mime.buf,
               etag, (uint64_t) cl, gzip ? "Content-Encoding: gzip\r\n" : "",
-              range, opts->extra_headers ? opts->extra_headers : "");
+              range, eh ? eh : "");
     if (mg_strcasecmp(hm->method, mg_str("HEAD")) == 0 || c->is_closing) {
       c->is_resp = 0;
       mg_fs_close(fd);
@@ -663,6 +714,12 @@ void mg_http_serve_file(struct mg_connection *c, struct mg_http_message *hm,
       *clp = cl;
     }
   }
+}
+
+void mg_http_serve_file(struct mg_connection *c, struct mg_http_message *hm,
+                        const char *path,
+                        const struct mg_http_serve_opts *opts) {
+  mg_http_serve_file2(c, hm, path, opts, true);
 }
 
 struct printdirentrydata {
@@ -860,20 +917,31 @@ static int uri_to_path(struct mg_connection *c, struct mg_http_message *hm,
 void mg_http_serve_dir(struct mg_connection *c, struct mg_http_message *hm,
                        const struct mg_http_serve_opts *opts) {
   char path[MG_PATH_MAX];
+  char rl_headers[160], extra_headers[512];
+  struct mg_http_serve_opts ropts;
   const char *sp = opts->ssi_pattern;
+  memset(&ropts, 0, sizeof(ropts));
+  ropts = *opts;
+  rl_headers[0] = extra_headers[0] = '\0';
+  if (!mg_http_apply_rate_limit(c, hm, opts, rl_headers, sizeof(rl_headers))) return;
+  if (rl_headers[0] != '\0') {
+    mg_http_append_headers(extra_headers, sizeof(extra_headers), opts->extra_headers,
+                           rl_headers);
+    ropts.extra_headers = extra_headers;
+  }
   int flags = uri_to_path(c, hm, opts, path, sizeof(path));
   if (flags < 0) {
     // Do nothing: the response has already been sent by uri_to_path()
   } else if (flags & MG_FS_DIR) {
 #if MG_ENABLE_DIRLIST
-    listdir(c, hm, opts, path);
+    listdir(c, hm, &ropts, path);
 #else
     mg_http_reply(c, 403, "", "Forbidden\n");
 #endif
   } else if (flags && sp != NULL && mg_match(mg_str(path), mg_str(sp), NULL)) {
-    mg_http_serve_ssi(c, opts->root_dir, path);
+    mg_http_serve_ssi(c, ropts.root_dir, path);
   } else {
-    mg_http_serve_file(c, hm, path, opts);
+    mg_http_serve_file2(c, hm, path, &ropts, false);
   }
 }
 
